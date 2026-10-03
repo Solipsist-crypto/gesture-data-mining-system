@@ -1,0 +1,11 @@
+__pycache__/
+.venv/
+archives/
+models/
+results/
+*.png
+*.txt
+*.bat
+face_landmarker.task
+gaze_calibration.json
+testcode.py
