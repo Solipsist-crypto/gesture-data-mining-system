@@ -20,7 +20,7 @@ from matplotlib.figure import Figure
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -45,13 +45,27 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from scipy.ndimage import shift as nd_shift
 from sklearn.cluster import KMeans
+from sklearn.datasets import load_digits
 from sklearn.decomposition import PCA
-from sklearn.metrics import accuracy_score
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.metrics import accuracy_score, mean_squared_error, r2_score
 from sklearn.model_selection import cross_val_score, train_test_split
-from sklearn.neural_network import MLPClassifier
+from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+# PyTorch необов'язковий: якщо його немає, CNN замінюється на MLP
+try:
+    import torch
+    import torch.nn as nn
+
+    TORCH_OK = True
+except ImportError:
+    TORCH_OK = False
 
 ROOT = Path(__file__).resolve().parent
 MODELS_DIR = ROOT / "models"
@@ -143,12 +157,998 @@ class OneEuroFilter:
         return x_hat
 
 
+class PaintCanvas(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(200, 200)
+        self.image = QImage(200, 200, QImage.Format_Grayscale8)
+        self.image.fill(Qt.black)
+        self.drawing = False
+        self.last_point = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.drawing = True
+            self.last_point = event.position().toPoint()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton and self.drawing:
+            painter = QPainter(self.image)
+            painter.setPen(QPen(Qt.white, 14, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawLine(self.last_point, event.position().toPoint())
+            painter.end()
+            self.last_point = event.position().toPoint()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.drawing = False
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.drawImage(0, 0, self.image)
+
+    def clear(self):
+        self.image.fill(Qt.black)
+        self.update()
+
+    def get_image_array(self):
+        # Повне зображення 200x200 у діапазоні 0..1 (без стиснення до 28x28)
+        ptr = self.image.constBits()
+        arr = np.frombuffer(ptr, np.uint8).reshape((200, 200)).copy()
+        return arr / 255.0
+
+
+# =========================================================
+# 📝 ДОПОМІЖНІ ФУНКЦІЇ ДЛЯ ЛАБИ №8
+# =========================================================
+POSITIVE_TEXTS = [
+    "Чудовий фільм, неймовірна гра акторів і цікавий сюжет!",
+    "Мені дуже сподобалося, це був прекрасний досвід.",
+    "Найкращий фільм, який я бачив, раджу всім!",
+    "Відмінна якість, я дуже задоволений покупкою.",
+    "Прекрасний сервіс і привітний персонал.",
+    "Все супер, дякую за швидку доставку!",
+    "Чудовий товар, працює відмінно і виглядає гарно.",
+    "Дуже гарний досвід, рекомендую всім друзям.",
+    "Якість перевершила мої очікування, вражаюче!",
+    "Я в захваті, це просто чудово і красиво.",
+    "Чудова акторська гра і зворушлива історія.",
+    "Дуже задоволений, гроші витрачені не дарма.",
+    "Зручно, комфортно і якісно, все сподобалось.",
+    "Неймовірні враження, обов'язково повернуся ще раз.",
+    "Найкраща покупка за останній час, супер!",
+    "Приємний фільм, смішний і розумний, дивився із задоволенням.",
+    "Відмінне обслуговування, ввічливі та уважні працівники.",
+    "Смачна їжа, затишна атмосфера, все було чудово.",
+    "Дуже радий, що вибрав саме цей товар, він бездоганний.",
+    "Прекрасний день, настрій чудовий, все вдалося!",
+    "Гарна робота, молодці, так тримати!",
+    "Це було фантастично, я отримав справжню насолоду.",
+    "Хороша ціна і висока якість, купуйте не вагаючись.",
+    "Дякую, все пройшло чудово, залишився дуже задоволений.",
+    "Дуже цікава і корисна книга, читається на одному диханні.",
+    "Чудовий відпочинок, мальовнича природа і добрі люди.",
+    "Мені подобається, зручний, надійний і красивий.",
+    "Просто бездоганно, найкращий сервіс, який я зустрічав.",
+    "Класний фільм, гарні емоції та чудова музика.",
+    "Я щасливий, усе працює швидко і без помилок.",
+]
+
+NEGATIVE_TEXTS = [
+    "Жахливий фільм, марна трата часу і грошей.",
+    "Погана гра акторів, нудний сюжет і слабка режисура.",
+    "Мені дуже не сподобалося, це було огидно.",
+    "Жахливий досвід, погана якість.",
+    "Найгірший сервіс, грубий персонал.",
+    "Дуже розчарований, шкодую, що купив цей товар.",
+    "Низька якість, зламалося вже за один день.",
+    "Нудно і повільно, я заснув посеред фільму.",
+    "Жахливий товар, зовсім не працює.",
+    "Поганий досвід, більше ніколи сюди не прийду.",
+    "Дурний сюжет і жахлива акторська гра.",
+    "Бридка їжа і брудне місце, дуже неприємно.",
+    "Не рекомендую, дешева і потворна якість.",
+    "Повна дурниця, все погано і дратує.",
+    "Я незадоволений, це найгірша покупка в моєму житті.",
+    "Страшенно нудний фільм, тупий і безглуздий.",
+    "Доставка запізнилася на тиждень, ніхто не відповідає на дзвінки.",
+    "Обслуговування просто жахливе, мене обманули.",
+    "Дуже поганий товар, гроші викинуті на вітер.",
+    "Ненавиджу цей додаток, постійно вилітає з помилками.",
+    "Жахлива робота, соромно за такий результат.",
+    "Це було огидно, зіпсований настрій на весь день.",
+    "Занадто дорого і дуже низька якість, не купуйте.",
+    "Дякую за нічого, повний провал, залишився розчарованим.",
+    "Нудна і марна книга, ледве дочитав до кінця.",
+    "Жахливий відпочинок, брудно, галасливо і неприємний персонал.",
+    "Мені не подобається, незручний, ненадійний і негарний.",
+    "Просто катастрофа, найгірший сервіс, який я бачив.",
+    "Поганий фільм, нудні діалоги та дратівлива музика.",
+    "Я засмучений, усе працює повільно і з помилками.",
+]
+
+
+def make_text_vectorizer():
+    # char_wb n-грами добре працюють з українською морфологією
+    return TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), lowercase=True, sublinear_tf=True)
+
+
+def preprocess_digit(img):
+    """200x200 (0..1) -> 8x8 (0..1) у стилі sklearn digits: обрізка, центрування, масштаб."""
+    mask = img > 0.15
+    if not mask.any():
+        return None
+    ys, xs = np.where(mask)
+    crop = img[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    h, w = crop.shape
+    side = max(h, w)
+    square = np.zeros((side, side), dtype=np.float32)
+    top = (side - h) // 2
+    left = (side - w) // 2
+    square[top:top + h, left:left + w] = crop
+    pad = int(side * 0.2)
+    square = np.pad(square, pad)
+    small = cv2.resize(square, (8, 8), interpolation=cv2.INTER_AREA)
+    return small / max(small.max(), 1e-6)
+
+
+def _augment_digits(images, labels, copies=4):
+    rng = np.random.default_rng(42)
+    xs, ys = [images], [labels]
+    for _ in range(copies):
+        aug = np.array([
+            nd_shift(im, rng.uniform(-1, 1, 2), order=1, mode="constant")
+            for im in images
+        ])
+        xs.append(aug)
+        ys.append(labels)
+    return np.concatenate(xs), np.concatenate(ys)
+
+
+if TORCH_OK:
+    class DigitCNN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(),
+                nn.MaxPool2d(2),  # 8 -> 4
+                nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(),
+                nn.MaxPool2d(2),  # 4 -> 2
+                nn.Flatten(),
+                nn.Linear(32 * 2 * 2, 64), nn.ReLU(),
+                nn.Linear(64, 10),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+
+# =========================================================
+# 📝 ВІКНО ЛАБОРАТОРНОЇ №8: РОЗПІЗНАВАННЯ ТЕКСТУ ТА CNN
+# =========================================================
+class TextCnnWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Lab 8 | Розпізнавання тексту та згорткові мережі (CNN)")
+        self.resize(1000, 750)
+        self.text_model = None
+        self.vectorizer = make_text_vectorizer()
+        self.cnn_model = None
+        self.cnn_kind = None
+        self.build_ui()
+        self.init_default_text_model()
+
+    def build_ui(self):
+        layout = QVBoxLayout(self)
+
+        top_bar = QHBoxLayout()
+        load_text_btn = QPushButton("📁 Завантажити датасет текстів (CSV)")
+        load_text_btn.clicked.connect(self.load_text_dataset)
+        self.data_info_label = QLabel("Модель тексту: TF-IDF (символьні n-грами) + LogisticRegression")
+        top_bar.addWidget(load_text_btn)
+        top_bar.addWidget(self.data_info_label)
+        top_bar.addStretch()
+        layout.addLayout(top_bar)
+
+        main_split = QHBoxLayout()
+
+        text_group = QGroupBox("1. Аналіз тексту (тональність)")
+        text_layout = QVBoxLayout(text_group)
+
+        self.text_input = QTextEdit()
+        self.text_input.setPlaceholderText("Введіть текст повідомлення (наприклад: 'Цей фільм просто чудовий!')")
+        self.text_input.setMaximumHeight(100)
+
+        predict_text_btn = QPushButton("🔍 Розпізнати тональність тексту")
+        predict_text_btn.clicked.connect(self.predict_text_sentiment)
+
+        self.text_result_label = QLabel("Результат: --")
+        self.text_result_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #1a365d;")
+
+        text_layout.addWidget(QLabel("Введення повідомлення:"))
+        text_layout.addWidget(self.text_input)
+        text_layout.addWidget(predict_text_btn)
+        text_layout.addWidget(self.text_result_label)
+        text_layout.addStretch()
+
+        main_split.addWidget(text_group, 1)
+
+        cnn_group = QGroupBox("2. Згорткова нейромережа / Малювання (CNN)")
+        cnn_layout = QVBoxLayout(cnn_group)
+
+        self.canvas_widget = PaintCanvas()
+        clear_canvas_btn = QPushButton("🧹 Очистити полотно")
+        clear_canvas_btn.clicked.connect(self.canvas_widget.clear)
+
+        predict_cnn_btn = QPushButton("🧠 Розпізнати цифру (CNN)")
+        predict_cnn_btn.clicked.connect(self.predict_canvas_cnn)
+
+        self.cnn_result_label = QLabel("Результат CNN: --")
+        self.cnn_result_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #2e7d32;")
+
+        cnn_layout.addWidget(QLabel("Намалюйте цифру мишею (на все полотно):"))
+        cnn_layout.addWidget(self.canvas_widget, alignment=Qt.AlignCenter)
+        cnn_layout.addWidget(clear_canvas_btn)
+        cnn_layout.addWidget(predict_cnn_btn)
+        cnn_layout.addWidget(self.cnn_result_label)
+
+        main_split.addWidget(cnn_group, 1)
+
+        layout.addLayout(main_split)
+
+        self.figure = Figure(figsize=(6, 3), tight_layout=True)
+        self.plot_canvas = FigureCanvas(self.figure)
+        layout.addWidget(self.plot_canvas)
+
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setMaximumHeight(100)
+        layout.addWidget(self.log_output)
+
+    def init_default_text_model(self):
+        texts = POSITIVE_TEXTS + NEGATIVE_TEXTS
+        labels = [1] * len(POSITIVE_TEXTS) + [0] * len(NEGATIVE_TEXTS)
+        self.vectorizer = make_text_vectorizer()
+        x_vec = self.vectorizer.fit_transform(texts)
+        self.text_model = LogisticRegression(C=20, max_iter=2000)
+        self.text_model.fit(x_vec, labels)
+        self.log_output.setPlainText(
+            f"Базову модель аналізу тексту ініціалізовано ({len(texts)} українських прикладів)."
+        )
+
+    def load_text_dataset(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Завантажити текстовий датасет", str(RESULTS_DIR), "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            df = pd.read_csv(path)
+            self.vectorizer = make_text_vectorizer()
+            x_vec = self.vectorizer.fit_transform(df.iloc[:, 0].astype(str))
+            y = df.iloc[:, 1].values
+            self.text_model = LogisticRegression(C=20, max_iter=2000)
+            self.text_model.fit(x_vec, y)
+            self.data_info_label.setText(f"Завантажено записів: {len(df)}")
+            QMessageBox.information(self, "Успіх", "Текстовий датасет навчено!")
+        except Exception as e:
+            QMessageBox.critical(self, "Помилка", str(e))
+
+    def predict_text_sentiment(self):
+        text = self.text_input.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(self, "Увага", "Введіть текст повідомлення!")
+            return
+
+        x_vec = self.vectorizer.transform([text])
+        pred = self.text_model.predict(x_vec)[0]
+        probs = self.text_model.predict_proba(x_vec)[0]
+
+        sentiment = "Позитивний 😊" if pred == 1 else "Негативний 😡"
+        conf = max(probs) * 100
+        self.text_result_label.setText(f"Результат: {sentiment} ({conf:.1f}%)")
+
+        ax = self.figure.axes[0] if self.figure.axes else self.figure.add_subplot(111)
+        ax.clear()
+        ax.bar(["Негативний", "Позитивний"], probs, color=["red", "green"])
+        ax.set_title("Ймовірності тональності тексту")
+        ax.set_ylabel("Ймовірність")
+        ax.set_ylim(0, 1.0)
+        ax.grid(True, alpha=0.3)
+        self.plot_canvas.draw()
+
+    def _ensure_cnn(self):
+        if self.cnn_model is not None:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            digits = load_digits()
+            imgs = (digits.images / 16.0).astype(np.float32)
+            x, y = _augment_digits(imgs, digits.target)
+            x, y = x.astype(np.float32), y.astype(np.int64)
+
+            if TORCH_OK:
+                torch.manual_seed(42)
+                model = DigitCNN()
+                opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+                loss_fn = nn.CrossEntropyLoss()
+                xt = torch.from_numpy(x).unsqueeze(1)
+                yt = torch.from_numpy(y)
+                for _epoch in range(15):
+                    perm = torch.randperm(len(xt))
+                    for i in range(0, len(xt), 128):
+                        idx = perm[i:i + 128]
+                        opt.zero_grad()
+                        loss = loss_fn(model(xt[idx]), yt[idx])
+                        loss.backward()
+                        opt.step()
+                model.eval()
+                self.cnn_model = model
+                self.cnn_kind = "CNN (PyTorch: Conv2D + MaxPool)"
+            else:
+                clf = MLPClassifier(hidden_layer_sizes=(128, 64), max_iter=300, random_state=42)
+                clf.fit(x.reshape(len(x), -1), y)
+                self.cnn_model = clf
+                self.cnn_kind = "MLP (sklearn, PyTorch не встановлено)"
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def predict_canvas_cnn(self):
+        img = self.canvas_widget.get_image_array()
+        small = preprocess_digit(img)
+        if small is None:
+            QMessageBox.warning(self, "Увага", "Намалюйте цифру на полотні!")
+            return
+
+        self._ensure_cnn()
+        if TORCH_OK and isinstance(self.cnn_model, nn.Module):
+            with torch.no_grad():
+                inp = torch.from_numpy(small.astype(np.float32)).reshape(1, 1, 8, 8)
+                probs = torch.softmax(self.cnn_model(inp), dim=1)[0].numpy()
+        else:
+            probs = self.cnn_model.predict_proba(small.reshape(1, -1).astype(np.float32))[0]
+
+        digit = int(np.argmax(probs))
+        self.cnn_result_label.setText(
+            f"Результат CNN: розпізнано цифру '{digit}' ({probs[digit] * 100:.1f}%)"
+        )
+        self.log_output.setPlainText(
+            f"Модель: {self.cnn_kind}\nВхід 8x8 після обрізки та центрування."
+        )
+
+        ax = self.figure.axes[0] if self.figure.axes else self.figure.add_subplot(111)
+        ax.clear()
+        ax.bar(range(10), probs, color="#2e7d32")
+        ax.set_xticks(range(10))
+        ax.set_title("Ймовірності класів CNN (цифри 0-9)")
+        ax.set_ylabel("Ймовірність")
+        ax.set_ylim(0, 1.0)
+        ax.grid(True, alpha=0.3)
+        self.plot_canvas.draw()
+
+
+# =========================================================
+# 🌳 ВІКНО ЛАБОРАТОРНОЇ №7: ДЕРЕВА РІШЕНЬ (Decision Trees)
+# =========================================================
+class DecisionTreeWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Lab 7 | Дерева рішень (Decision Forests)")
+        self.resize(1000, 720)
+        self.data_x = None
+        self.data_y = None
+        self.trained_model = None
+        self.encoder = LabelEncoder()
+        self.build_ui()
+
+    def build_ui(self):
+        layout = QVBoxLayout(self)
+
+        top_bar = QHBoxLayout()
+        load_excel_btn = QPushButton("📁 Завантажити Excel/CSV")
+        load_excel_btn.clicked.connect(self.load_dataset)
+        load_npz_btn = QPushButton("📂 Завантажити датасет жестів (.npz)")
+        load_npz_btn.clicked.connect(self.load_npz_dataset)
+        self.data_info_label = QLabel("Дані не завантажено")
+
+        top_bar.addWidget(load_excel_btn)
+        top_bar.addWidget(load_npz_btn)
+        top_bar.addWidget(self.data_info_label)
+        top_bar.addStretch()
+        layout.addLayout(top_bar)
+
+        main_split = QHBoxLayout()
+
+        controls_box = QGroupBox("Параметри ансамблів дерев рішень")
+        ctrl_layout = QFormLayout(controls_box)
+
+        self.trees_count_spin = QSpinBox()
+        self.trees_count_spin.setRange(5, 500)
+        self.trees_count_spin.setValue(100)
+
+        self.max_depth_spin = QSpinBox()
+        self.max_depth_spin.setRange(2, 50)
+        self.max_depth_spin.setValue(10)
+
+        self.test_size_spin = QDoubleSpinBox()
+        self.test_size_spin.setRange(0.1, 0.5)
+        self.test_size_spin.setSingleStep(0.05)
+        self.test_size_spin.setValue(0.25)
+
+        run_rf_btn = QPushButton("🌲 1. Випадковий Ліс (Random Forest)")
+        run_rf_btn.clicked.connect(self.run_random_forest)
+
+        run_gb_btn = QPushButton("⚡ 2. Градієнтний Бустінг (Gradient Boosting)")
+        run_gb_btn.clicked.connect(self.run_gradient_boosting)
+
+        load_model_btn = QPushButton("📂 Завантажити навчену модель (.joblib)")
+        load_model_btn.clicked.connect(self.load_pretrained_model)
+
+        save_res_btn = QPushButton("💾 Зберегти звіт / модель у файл")
+        save_res_btn.clicked.connect(self.save_results)
+
+        ctrl_layout.addRow("Кількість дерев (n_estimators):", self.trees_count_spin)
+        ctrl_layout.addRow("Макс. глибина (max_depth):", self.max_depth_spin)
+        ctrl_layout.addRow("Частка тестових даних:", self.test_size_spin)
+        ctrl_layout.addRow(run_rf_btn)
+        ctrl_layout.addRow(run_gb_btn)
+        ctrl_layout.addRow(load_model_btn)
+        ctrl_layout.addRow(save_res_btn)
+
+        main_split.addWidget(controls_box, 1)
+
+        self.figure = Figure(figsize=(6, 5), tight_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        main_split.addWidget(self.canvas, 2)
+
+        layout.addLayout(main_split)
+
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        layout.addWidget(self.log_output)
+
+    def load_dataset(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Завантажити файл даних", str(RESULTS_DIR), "Data Files (*.xlsx *.csv)"
+        )
+        if not path:
+            return
+        try:
+            df = pd.read_csv(path) if path.endswith(".csv") else pd.read_excel(path)
+            self.data_x = df.iloc[:, :-1].values
+            self.data_y = df.iloc[:, -1].values
+            self.data_info_label.setText(f"Завантажено: {len(self.data_x)} рядків, {self.data_x.shape[1]} ознак")
+            QMessageBox.information(self, "Успіх", "Дані завантажено!")
+        except Exception as e:
+            QMessageBox.critical(self, "Помилка", str(e))
+
+    def load_npz_dataset(self):
+        if not DATA_PATH.exists():
+            QMessageBox.warning(self, "Помилка", "Датасет жестів не знайдено.")
+            return
+        data = np.load(DATA_PATH, allow_pickle=True)
+        self.data_x = data["features"]
+        self.data_y = self.encoder.fit_transform(data["labels"])
+        self.data_info_label.setText(f"Завантажено з NPZ: {len(self.data_x)} прикладів")
+        QMessageBox.information(self, "Успіх", "Жестовий датасет завантажено!")
+
+    def run_random_forest(self):
+        if self.data_x is None or self.data_y is None:
+            QMessageBox.warning(self, "Увага", "Спочатку завантажте дані!")
+            return
+
+        x_train, x_test, y_train, y_test = train_test_split(
+            self.data_x, self.data_y, test_size=self.test_size_spin.value(), random_state=42
+        )
+
+        model = RandomForestClassifier(
+            n_estimators=self.trees_count_spin.value(),
+            max_depth=self.max_depth_spin.value(),
+            random_state=42
+        )
+        model.fit(x_train, y_train)
+        self.trained_model = model
+
+        preds = model.predict(x_test)
+        acc = accuracy_score(y_test, preds)
+
+        self.plot_feature_importances(model.feature_importances_, "Важливість ознак (Random Forest)")
+        self.log_output.setPlainText(
+            f"Випадковий Ліс (Random Forest) навчено!\n"
+            f"Кількість дерев: {self.trees_count_spin.value()}\n"
+            f"Точність на тесті (Accuracy): {acc:.2%}"
+        )
+
+    def run_gradient_boosting(self):
+        if self.data_x is None or self.data_y is None:
+            QMessageBox.warning(self, "Увага", "Спочатку завантажте дані!")
+            return
+
+        x_train, x_test, y_train, y_test = train_test_split(
+            self.data_x, self.data_y, test_size=self.test_size_spin.value(), random_state=42
+        )
+
+        model = GradientBoostingClassifier(
+            n_estimators=self.trees_count_spin.value(),
+            max_depth=min(self.max_depth_spin.value(), 10),
+            random_state=42
+        )
+        model.fit(x_train, y_train)
+        self.trained_model = model
+
+        preds = model.predict(x_test)
+        acc = accuracy_score(y_test, preds)
+
+        self.plot_feature_importances(model.feature_importances_, "Важливість ознак (Gradient Boosting)")
+        self.log_output.setPlainText(
+            f"Градієнтний Бустінг (Gradient Boosting) навчено!\n"
+            f"Кількість дерев: {self.trees_count_spin.value()}\n"
+            f"Точність на тесті (Accuracy): {acc:.2%}"
+        )
+
+    def plot_feature_importances(self, importances, title):
+        ax = self.figure.axes[0] if self.figure.axes else self.figure.add_subplot(111)
+        ax.clear()
+        top_indices = np.argsort(importances)[-15:]
+        ax.barh(range(len(top_indices)), importances[top_indices], color="green")
+        ax.set_yticks(range(len(top_indices)))
+        ax.set_yticklabels([f"Ознака {i}" for i in top_indices])
+        ax.set_title(title)
+        ax.set_xlabel("Відносна важливість ознаки")
+        ax.grid(True, alpha=0.3)
+        self.canvas.draw()
+
+    def load_pretrained_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Завантажити навчену модель", str(MODELS_DIR), "Model Files (*.joblib)"
+        )
+        if path:
+            try:
+                bundle = joblib.load(path)
+                self.trained_model = bundle.get("model", bundle)
+                QMessageBox.information(self, "Успіх", f"Модель завантажено: {Path(path).name}")
+                self.log_output.setPlainText(f"Завантажено модель дерев рішення з {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Помилка", str(e))
+
+    def save_results(self):
+        if self.trained_model is None:
+            QMessageBox.warning(self, "Увага", "Немає навченої моделі для збереження.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Зберегти модель Дерева Рішень", str(MODELS_DIR / "tree_model.joblib"), "Model Files (*.joblib)"
+        )
+        if path:
+            joblib.dump({"model": self.trained_model, "encoder": self.encoder}, path)
+            QMessageBox.information(self, "Збережено", f"Модель збережено у {path}")
+
+
+# =========================================================
+# 📈 ВІКНО ЛАБОРАТОРНОЇ №6: ФУНКЦІОНАЛЬНІ ЗАЛЕЖНОСТІ
+# =========================================================
+class FunctionalDependencyWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Lab 6 | Функціональні залежності та регресія")
+        self.resize(1000, 720)
+        self.data_x = None
+        self.data_y = None
+        self.y_test = None
+        self.y_pred = None
+        self.build_ui()
+
+    def build_ui(self):
+        layout = QVBoxLayout(self)
+
+        top_bar = QHBoxLayout()
+        load_excel_btn = QPushButton("📁 Завантажити Excel/CSV")
+        load_excel_btn.clicked.connect(self.load_dataset)
+        load_npz_btn = QPushButton("📂 Завантажити датасет жестів (.npz)")
+        load_npz_btn.clicked.connect(self.load_npz_dataset)
+        self.data_info_label = QLabel("Дані не завантажено")
+
+        top_bar.addWidget(load_excel_btn)
+        top_bar.addWidget(load_npz_btn)
+        top_bar.addWidget(self.data_info_label)
+        top_bar.addStretch()
+        layout.addLayout(top_bar)
+
+        main_split = QHBoxLayout()
+
+        controls_box = QGroupBox("Параметри регресійних моделей")
+        ctrl_layout = QFormLayout(controls_box)
+
+        self.epochs_spin = QSpinBox()
+        self.epochs_spin.setRange(10, 1000)
+        self.epochs_spin.setValue(200)
+
+        self.test_size_spin = QDoubleSpinBox()
+        self.test_size_spin.setRange(0.1, 0.5)
+        self.test_size_spin.setSingleStep(0.05)
+        self.test_size_spin.setValue(0.20)
+
+        run_lin_reg_btn = QPushButton("📊 1. Лінійна / Множинна Регресія")
+        run_lin_reg_btn.clicked.connect(self.run_linear_regression)
+
+        run_dnn_reg_btn = QPushButton("🧠 2. Глибинна Нейронна Мережа (DNN)")
+        run_dnn_reg_btn.clicked.connect(self.run_dnn_regression)
+
+        save_res_btn = QPushButton("💾 Зберегти результати у файл")
+        save_res_btn.clicked.connect(self.save_results)
+
+        ctrl_layout.addRow("Епохи / Ітерації:", self.epochs_spin)
+        ctrl_layout.addRow("Частка тестових даних:", self.test_size_spin)
+        ctrl_layout.addRow(run_lin_reg_btn)
+        ctrl_layout.addRow(run_dnn_reg_btn)
+        ctrl_layout.addRow(save_res_btn)
+
+        main_split.addWidget(controls_box, 1)
+
+        self.figure = Figure(figsize=(6, 5), tight_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        main_split.addWidget(self.canvas, 2)
+
+        layout.addLayout(main_split)
+
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        layout.addWidget(self.log_output)
+
+    def load_dataset(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Завантажити файл даних", str(RESULTS_DIR), "Data Files (*.xlsx *.csv)"
+        )
+        if not path:
+            return
+        try:
+            df = pd.read_csv(path) if path.endswith(".csv") else pd.read_excel(path)
+            self.data_x = df.iloc[:, :-1].values
+            self.data_y = df.iloc[:, -1].values
+            self.data_info_label.setText(f"Завантажено: {len(self.data_x)} рядків, {self.data_x.shape[1]} ознак")
+            QMessageBox.information(self, "Успіх", "Дані завантажено!")
+        except Exception as e:
+            QMessageBox.critical(self, "Помилка", str(e))
+
+    def load_npz_dataset(self):
+        if not DATA_PATH.exists():
+            QMessageBox.warning(self, "Помилка", "Датасет жестів не знайдено.")
+            return
+        data = np.load(DATA_PATH, allow_pickle=True)
+        self.data_x = data["features"]
+        encoder = LabelEncoder()
+        self.data_y = encoder.fit_transform(data["labels"]).astype(float)
+        self.data_info_label.setText(f"Завантажено з NPZ: {len(self.data_x)} прикладів")
+        QMessageBox.information(self, "Успіх", "Жестовий датасет завантажено!")
+
+    def run_linear_regression(self):
+        if self.data_x is None or self.data_y is None:
+            QMessageBox.warning(self, "Увага", "Спочатку завантажте дані!")
+            return
+
+        x_train, x_test, y_train, y_test = train_test_split(
+            self.data_x, self.data_y, test_size=self.test_size_spin.value(), random_state=42
+        )
+
+        scaler = StandardScaler()
+        x_train_scaled = scaler.fit_transform(x_train)
+        x_test_scaled = scaler.transform(x_test)
+
+        model = LinearRegression()
+        model.fit(x_train_scaled, y_train)
+
+        self.y_test = y_test
+        self.y_pred = model.predict(x_test_scaled)
+
+        mse = mean_squared_error(y_test, self.y_pred)
+        r2 = r2_score(y_test, self.y_pred)
+
+        self.plot_predictions("Лінійна регресія (Реальні значення vs Прогноз)")
+        self.log_output.setPlainText(
+            f"Множинна Лінійна Регресія завершена!\n"
+            f"Mean Squared Error (MSE): {mse:.4f}\n"
+            f"Коефіцієнт детермінації (R² Score): {r2:.4f}"
+        )
+
+    def run_dnn_regression(self):
+        if self.data_x is None or self.data_y is None:
+            QMessageBox.warning(self, "Увага", "Спочатку завантажте дані!")
+            return
+
+        x_train, x_test, y_train, y_test = train_test_split(
+            self.data_x, self.data_y, test_size=self.test_size_spin.value(), random_state=42
+        )
+
+        scaler = StandardScaler()
+        x_train_scaled = scaler.fit_transform(x_train)
+        x_test_scaled = scaler.transform(x_test)
+
+        model = MLPRegressor(
+            hidden_layer_sizes=(64, 32),
+            activation="relu",
+            max_iter=self.epochs_spin.value(),
+            random_state=42
+        )
+        model.fit(x_train_scaled, y_train)
+
+        self.y_test = y_test
+        self.y_pred = model.predict(x_test_scaled)
+
+        mse = mean_squared_error(y_test, self.y_pred)
+        r2 = r2_score(y_test, self.y_pred)
+
+        ax = self.figure.axes[0] if self.figure.axes else self.figure.add_subplot(111)
+        ax.clear()
+        ax.plot(model.loss_curve_, color="purple", linewidth=2, label="Крива втрат (MSE)")
+        ax.set_title("Навчання Глибинної Нейромережі (DNN Loss)")
+        ax.set_xlabel("Епохи (Epochs)")
+        ax.set_ylabel("Похибка (Loss)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        self.canvas.draw()
+
+        self.log_output.setPlainText(
+            f"Глибинна Нейронна Мережа (DNN) завершена!\n"
+            f"Mean Squared Error (MSE): {mse:.4f}\n"
+            f"Коефіцієнт детермінації (R² Score): {r2:.4f}\n"
+            f"Кількість ітерацій: {len(model.loss_curve_)}"
+        )
+
+    def plot_predictions(self, title):
+        ax = self.figure.axes[0] if self.figure.axes else self.figure.add_subplot(111)
+        ax.clear()
+        ax.scatter(self.y_test, self.y_pred, color="blue", alpha=0.7, label="Передбачення")
+        ax.plot([min(self.y_test), max(self.y_test)], [min(self.y_test), max(self.y_test)], 'r--', label="Ідеальна залежність")
+        ax.set_title(title)
+        ax.set_xlabel("Реальні значення Y")
+        ax.set_ylabel("Передбачені значення Y'")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        self.canvas.draw()
+
+    def save_results(self):
+        if self.y_pred is None:
+            QMessageBox.warning(self, "Увага", "Немає результатів для збереження.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Зберегти звіт регресії", str(RESULTS_DIR / "regression_report.csv"), "CSV Files (*.csv)"
+        )
+        if path:
+            df = pd.DataFrame({"Actual": self.y_test, "Predicted": self.y_pred, "Error": self.y_test - self.y_pred})
+            df.to_csv(path, index=False)
+            QMessageBox.information(self, "Збережено", f"Звіт збережено у {path}")
+
+
+# =========================================================
+# 🧬 ВІКНО ГЕНЕТИЧНИХ АЛГОРИТМІВ (Custom GA)
+# =========================================================
+class CustomGeneticAlgorithm:
+    def __init__(self, num_genes, pop_size=20, generations=50, mutation_rate=0.1):
+        self.num_genes = num_genes
+        self.pop_size = pop_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.population = np.random.uniform(-1.0, 1.0, (pop_size, num_genes))
+        self.history = []
+
+    def fitness_function(self, chromosome, X, y, is_classification=False):
+        if is_classification:
+            logits = np.dot(X, chromosome)
+            probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -15, 15)))
+            preds = (probs > 0.5).astype(int)
+            acc = np.mean(preds == y)
+            return acc + 1e-6
+        else:
+            preds = np.dot(X, chromosome)
+            mse = np.mean((y - preds) ** 2)
+            return 1.0 / (mse + 1e-6)
+
+    def run(self, X, y, is_classification=False):
+        self.history = []
+        best_chrom = None
+        best_fit = -1
+
+        for gen in range(self.generations):
+            fitnesses = np.array([self.fitness_function(c, X, y, is_classification) for c in self.population])
+
+            idx_best = np.argmax(fitnesses)
+            if fitnesses[idx_best] > best_fit:
+                best_fit = fitnesses[idx_best]
+                best_chrom = self.population[idx_best].copy()
+
+            self.history.append(best_fit)
+
+            probs = fitnesses / np.sum(fitnesses)
+            selected_indices = np.random.choice(self.pop_size, size=self.pop_size, p=probs)
+            parents = self.population[selected_indices]
+
+            new_population = []
+            for i in range(0, self.pop_size, 2):
+                p1, p2 = parents[i], parents[(i + 1) % self.pop_size]
+                point = np.random.randint(1, self.num_genes) if self.num_genes > 1 else 0
+                child1 = np.concatenate([p1[:point], p2[point:]])
+                child2 = np.concatenate([p2[:point], p1[point:]])
+                new_population.extend([child1, child2])
+
+            self.population = np.array(new_population[:self.pop_size])
+
+            mutation_mask = np.random.rand(*self.population.shape) < self.mutation_rate
+            noise = np.random.normal(0, 0.2, size=self.population.shape)
+            self.population += mutation_mask * noise
+
+        return best_chrom, best_fit
+
+
+class GeneticAnalysisWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Lab 5 | Генетичний алгоритм (Custom GA)")
+        self.resize(1000, 700)
+        self.data_x = None
+        self.data_y = None
+        self.ga_history = []
+        self.build_ui()
+
+    def build_ui(self):
+        layout = QVBoxLayout(self)
+
+        top_bar = QHBoxLayout()
+        load_excel_btn = QPushButton("📁 Завантажити Excel/CSV")
+        load_excel_btn.clicked.connect(self.load_dataset)
+        load_npz_btn = QPushButton("📂 Завантажити датасет жестів (.npz)")
+        load_npz_btn.clicked.connect(self.load_npz_dataset)
+        self.data_info_label = QLabel("Дані не завантажено")
+
+        top_bar.addWidget(load_excel_btn)
+        top_bar.addWidget(load_npz_btn)
+        top_bar.addWidget(self.data_info_label)
+        top_bar.addStretch()
+        layout.addLayout(top_bar)
+
+        main_split = QHBoxLayout()
+
+        controls_box = QGroupBox("Параметри генетичного алгоритму")
+        ctrl_layout = QFormLayout(controls_box)
+
+        self.generations_spin = QSpinBox()
+        self.generations_spin.setRange(5, 500)
+        self.generations_spin.setValue(50)
+
+        self.sol_per_pop_spin = QSpinBox()
+        self.sol_per_pop_spin.setRange(4, 100)
+        self.sol_per_pop_spin.setValue(20)
+
+        self.mutation_percent_spin = QDoubleSpinBox()
+        self.mutation_percent_spin.setRange(0.01, 1.0)
+        self.mutation_percent_spin.setSingleStep(0.05)
+        self.mutation_percent_spin.setValue(0.10)
+
+        run_ga_cls_btn = QPushButton("🧬 1. Генетична Класифікація (Accuracy)")
+        run_ga_cls_btn.clicked.connect(self.run_ga_classification)
+
+        run_ga_reg_btn = QPushButton("⚙️ 2. Генетична Оптимізація (MSE Loss)")
+        run_ga_reg_btn.clicked.connect(self.run_ga_regression)
+
+        save_res_btn = QPushButton("💾 Зберегти звіт у файл")
+        save_res_btn.clicked.connect(self.save_results)
+
+        ctrl_layout.addRow("Кількість поколінь:", self.generations_spin)
+        ctrl_layout.addRow("Розмір популяції:", self.sol_per_pop_spin)
+        ctrl_layout.addRow("Ймовірність мутацій:", self.mutation_percent_spin)
+        ctrl_layout.addRow(run_ga_cls_btn)
+        ctrl_layout.addRow(run_ga_reg_btn)
+        ctrl_layout.addRow(save_res_btn)
+
+        main_split.addWidget(controls_box, 1)
+
+        self.figure = Figure(figsize=(6, 5), tight_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        main_split.addWidget(self.canvas, 2)
+
+        layout.addLayout(main_split)
+
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        layout.addWidget(self.log_output)
+
+    def load_dataset(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Завантажити файл даних", str(RESULTS_DIR), "Data Files (*.xlsx *.csv)"
+        )
+        if not path:
+            return
+        try:
+            df = pd.read_csv(path) if path.endswith(".csv") else pd.read_excel(path)
+            self.data_x = df.iloc[:, :-1].values
+            self.data_y = df.iloc[:, -1].values
+            self.data_info_label.setText(f"Завантажено: {len(self.data_x)} рядків")
+            QMessageBox.information(self, "Успіх", "Дані завантажено!")
+        except Exception as e:
+            QMessageBox.critical(self, "Помилка", str(e))
+
+    def load_npz_dataset(self):
+        if not DATA_PATH.exists():
+            QMessageBox.warning(self, "Помилка", "Датасет жестів не знайдено.")
+            return
+        data = np.load(DATA_PATH, allow_pickle=True)
+        self.data_x = data["features"]
+        encoder = LabelEncoder()
+        self.data_y = (encoder.fit_transform(data["labels"]) > 0).astype(int)
+        self.data_info_label.setText(f"Завантажено NPZ: {len(self.data_x)} прикладів")
+        QMessageBox.information(self, "Успіх", "Жестовий датасет завантажено!")
+
+    def run_ga_classification(self):
+        if self.data_x is None or self.data_y is None:
+            QMessageBox.warning(self, "Увага", "Спочатку завантажте дані!")
+            return
+
+        ga = CustomGeneticAlgorithm(
+            num_genes=self.data_x.shape[1],
+            pop_size=self.sol_per_pop_spin.value(),
+            generations=self.generations_spin.value(),
+            mutation_rate=self.mutation_percent_spin.value()
+        )
+
+        best_chrom, best_fit = ga.run(self.data_x, self.data_y, is_classification=True)
+        self.ga_history = ga.history
+        self.plot_fitness("Генетична класифікація (Accuracy Fitness)")
+        self.log_output.setPlainText(
+            f"Генетичну класифікацію завершено!\n"
+            f"Найкраща пристосованість (Accuracy/Fitness): {best_fit:.4f}\n"
+            f"Кількість хромосом (ваг): {len(best_chrom)}"
+        )
+
+    def run_ga_regression(self):
+        if self.data_x is None or self.data_y is None:
+            QMessageBox.warning(self, "Увага", "Спочатку завантажте дані!")
+            return
+
+        ga = CustomGeneticAlgorithm(
+            num_genes=self.data_x.shape[1],
+            pop_size=self.sol_per_pop_spin.value(),
+            generations=self.generations_spin.value(),
+            mutation_rate=self.mutation_percent_spin.value()
+        )
+
+        best_chrom, best_fit = ga.run(self.data_x, self.data_y, is_classification=False)
+        self.ga_history = ga.history
+        self.plot_fitness("Генетична оптимізація (1 / MSE Fitness)")
+        self.log_output.setPlainText(
+            f"Генетичну оптимізацію завершено!\n"
+            f"Найкраща пристосованість (Fitness): {best_fit:.4f}\n"
+            f"MSE Loss: {1.0 / best_fit:.6f}"
+        )
+
+    def plot_fitness(self, title):
+        ax = self.figure.axes[0] if self.figure.axes else self.figure.add_subplot(111)
+        ax.clear()
+        ax.plot(self.ga_history, marker="o", color="blue", linewidth=2)
+        ax.set_title(title)
+        ax.set_xlabel("Покоління (Generations)")
+        ax.set_ylabel("Пристосованість (Fitness)")
+        ax.grid(True, alpha=0.3)
+        self.canvas.draw()
+
+    def save_results(self):
+        if not self.ga_history:
+            QMessageBox.warning(self, "Увага", "Немає результатів для збереження.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Зберегти звіт ГА", str(RESULTS_DIR / "genetic_report.txt"), "Text Files (*.txt)"
+        )
+        if path:
+            df = pd.DataFrame({"Generation": range(len(self.ga_history)), "Fitness": self.ga_history})
+            df.to_csv(path, index=False)
+            QMessageBox.information(self, "Збережено", f"Звіт збережено у {path}")
+
+
 # =========================================================
 # 🧠 КЛАСИ НЕЧІТКОГО АНАЛІЗУ (Fuzzy Logic Models)
 # =========================================================
 class FuzzyCMeans:
-    """Модель нечіткої кластеризації (Fuzzy C-Means / FCM)"""
-
     def __init__(self, n_clusters=3, m=2.0, max_iter=100, error=1e-5):
         self.n_clusters = n_clusters
         self.m = m
@@ -180,8 +1180,6 @@ class FuzzyCMeans:
 
 
 class FuzzyClassifier:
-    """Модель нечіткої класифікації на основі гаусових функцій належності та поверхонь відстаней"""
-
     def __init__(self, sigma=1.0):
         self.sigma = sigma
         self.classes_ = None
@@ -203,9 +1201,6 @@ class FuzzyClassifier:
         return self.classes_[np.argmax(proba, axis=1)]
 
 
-# =========================================================
-# 🪟 НОВЕ ВІКНО: НЕЧІТКИЙ АНАЛІЗ ДАНИХ (Fuzzy Window)
-# =========================================================
 class FuzzyAnalysisWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -235,7 +1230,6 @@ class FuzzyAnalysisWindow(QDialog):
 
         main_split = QHBoxLayout()
 
-        # Панель налаштувань
         controls_box = QGroupBox("Параметри нечітких моделей")
         ctrl_layout = QFormLayout(controls_box)
 
@@ -271,14 +1265,12 @@ class FuzzyAnalysisWindow(QDialog):
 
         main_split.addWidget(controls_box, 1)
 
-        # Графічна зона Matplotlib
         self.figure = Figure(figsize=(6, 5), tight_layout=True)
         self.canvas = FigureCanvas(self.figure)
         main_split.addWidget(self.canvas, 2)
 
         layout.addLayout(main_split)
 
-        # Таблиця виведення нечітких ступенів належності
         self.table = QTableWidget()
         layout.addWidget(self.table)
 
@@ -289,36 +1281,29 @@ class FuzzyAnalysisWindow(QDialog):
         if not path:
             return
         try:
-            if path.endswith(".csv"):
-                df = pd.read_csv(path)
-            else:
-                df = pd.read_excel(path)
-
+            df = pd.read_csv(path) if path.endswith(".csv") else pd.read_excel(path)
             self.data_x = df.iloc[:, :-1].values
             self.data_y = df.iloc[:, -1].values
-            self.data_info_label.setText(f"Завантажено: {len(self.data_x)} рядків, {self.data_x.shape[1]} ознак")
-            QMessageBox.information(self, "Успіх", "Дані успішно завантажено!")
+            self.data_info_label.setText(f"Завантажено: {len(self.data_x)} рядків")
+            QMessageBox.information(self, "Успіх", "Дані завантажено!")
         except Exception as e:
-            QMessageBox.critical(self, "Помилка", f"Не вдалося прочитати файл:\n{str(e)}")
+            QMessageBox.critical(self, "Помилка", str(e))
 
     def load_npz_dataset(self):
         if not DATA_PATH.exists():
-            QMessageBox.warning(self, "Помилка", "Набір даних gesture_samples.npz не знайдено.")
+            QMessageBox.warning(self, "Помилка", "Датасет жестів не знайдено.")
             return
         data = np.load(DATA_PATH, allow_pickle=True)
         self.data_x = data["features"]
         self.data_y = data["labels"]
         self.data_info_label.setText(f"Завантажено з NPZ: {len(self.data_x)} прикладів")
-        QMessageBox.information(self, "Успіх", "Жестовий датасет завантажено у нечітку модель!")
+        QMessageBox.information(self, "Успіх", "Датасет завантажено!")
 
     def run_fcm(self):
-        if self.data_x is None or len(self.data_x) == 0:
-            QMessageBox.warning(self, "Увага", "Спочатку завантажте набір даних!")
+        if self.data_x is None:
             return
-
         k = self.cluster_count_spin.value()
         m = self.fuzziness_spin.value()
-
         self.fcm_model = FuzzyCMeans(n_clusters=k, m=m)
         self.fcm_model.fit(self.data_x)
 
@@ -327,20 +1312,11 @@ class FuzzyAnalysisWindow(QDialog):
 
         ax = self.figure.axes[0] if self.figure.axes else self.figure.add_subplot(111)
         ax.clear()
-
         hard_clusters = np.argmax(self.fcm_model.u, axis=1)
-        scatter = ax.scatter(reduced[:, 0], reduced[:, 1], c=hard_clusters, cmap="tab10", alpha=0.7)
+        ax.scatter(reduced[:, 0], reduced[:, 1], c=hard_clusters, cmap="tab10", alpha=0.7)
 
         centers_reduced = pca.transform(self.fcm_model.centers)
-        ax.scatter(
-            centers_reduced[:, 0],
-            centers_reduced[:, 1],
-            c="red",
-            marker="X",
-            s=150,
-            label="Нечіткі центри",
-        )
-
+        ax.scatter(centers_reduced[:, 0], centers_reduced[:, 1], c="red", marker="X", s=150, label="Нечіткі центри")
         ax.set_title(f"Fuzzy C-Means (K={k}, m={m})")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -350,9 +1326,7 @@ class FuzzyAnalysisWindow(QDialog):
 
     def run_fuzzy_classification(self):
         if self.data_x is None or self.data_y is None:
-            QMessageBox.warning(self, "Увага", "Потрібно завантажити дані з класами!")
             return
-
         sigma = self.sigma_spin.value()
         self.fuzzy_clf = FuzzyClassifier(sigma=sigma)
         self.fuzzy_clf.fit(self.data_x, self.data_y)
@@ -361,14 +1335,10 @@ class FuzzyAnalysisWindow(QDialog):
 
         ax = self.figure.axes[0] if self.figure.axes else self.figure.add_subplot(111)
         ax.clear()
-
         classes = self.fuzzy_clf.classes_
         for i, c in enumerate(classes):
             ax.plot(probs[:50, i], label=f"Належність до {c}")
-
         ax.set_title(f"Нечітка класифікація (σ={sigma})")
-        ax.set_ylabel("Ступінь належності u(x)")
-        ax.set_xlabel("Приклади (перші 50)")
         ax.legend()
         ax.grid(True, alpha=0.3)
         self.canvas.draw()
@@ -383,27 +1353,23 @@ class FuzzyAnalysisWindow(QDialog):
 
         for r in range(min(100, len(matrix))):
             for c in range(len(col_names)):
-                val = matrix[r, c]
-                self.table.setItem(r, c, QTableWidgetItem(f"{val:.4f}"))
+                self.table.setItem(r, c, QTableWidgetItem(f"{matrix[r, c]:.4f}"))
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
     def save_results(self):
         if self.fcm_model is None and self.fuzzy_clf is None:
-            QMessageBox.warning(self, "Помилка", "Немає обчислених результатів для збереження.")
             return
-
         path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти звіт нечіткого аналізу", str(RESULTS_DIR / "fuzzy_report.csv"), "CSV Files (*.csv)"
+            self, "Зберегти звіт", str(RESULTS_DIR / "fuzzy_report.csv"), "CSV Files (*.csv)"
         )
         if path:
             matrix = self.fcm_model.u if self.fcm_model is not None else self.fuzzy_clf.predict_proba(self.data_x)
-            df = pd.DataFrame(matrix)
-            df.to_csv(path, index=False)
-            QMessageBox.information(self, "Збережено", f"Результати нечіткого аналізу збережено у {path}")
+            pd.DataFrame(matrix).to_csv(path, index=False)
+            QMessageBox.information(self, "Збережено", f"Файл збережено: {path}")
 
 
 # =========================================================
-# 🖥️ ОСНОВНИЙ ІНТЕРФЕЙС ТА ГОЛОВНЕ ВІКНО
+# 🖥️ ОСНОВНИЙ ІНТЕРФЕЙС ТА ГОЛОВНЕ ВІКНО (Лаби 1-3)
 # =========================================================
 class GestureApp(QMainWindow):
     def __init__(self):
@@ -583,7 +1549,6 @@ class GestureApp(QMainWindow):
     def start_delayed_capture(self):
         if self.is_counting_down:
             return
-
         self.countdown_timer.stop()
         self.is_counting_down = True
         self._feature_buffer = []
@@ -746,20 +1711,16 @@ class GestureApp(QMainWindow):
                     self.gesture2_start_time = None
                     self.gesture3_start_time = None
                     self.gesture4_start_time = None
-
                     if self.right_palm_start_time is None:
                         self.right_palm_start_time = time.time()
-
                     elapsed = time.time() - self.right_palm_start_time
                     required_toggle_time = 3.0
 
                     if elapsed >= required_toggle_time:
                         self.mouse_control_active = not self.mouse_control_active
                         status = "ВКЛ 🖱️" if self.mouse_control_active else "ВИКЛ 🛑"
-
                         self.log.append(f"Права рука (3 сек) -> Режим мишки: {status}")
                         self.status_label.setText(f"✋ Перемикання мишки: {status}")
-
                         self.right_palm_start_time = None
                         self.cursor_filter_x = OneEuroFilter(mincutoff=1.2, beta=0.6, dcutoff=1.0)
                         self.cursor_filter_y = OneEuroFilter(mincutoff=1.2, beta=0.6, dcutoff=1.0)
@@ -769,18 +1730,14 @@ class GestureApp(QMainWindow):
                         self.status_label.setText(
                             f"✋ Утримайте праву долоню {rem:.1f} сек для {action_str} мишки..."
                         )
-
                 elif not self.mouse_control_active:
                     self.right_palm_start_time = None
-
                     if prediction == g1_name:
                         self.gesture2_start_time = None
                         self.gesture3_start_time = None
                         self.gesture4_start_time = None
-
                         if self.gesture1_start_time is None:
                             self.gesture1_start_time = time.time()
-
                         elapsed = time.time() - self.gesture1_start_time
                         if elapsed >= self.required_hold_duration:
                             pyautogui.press("volumeup")
@@ -789,15 +1746,12 @@ class GestureApp(QMainWindow):
                         else:
                             rem = self.required_hold_duration - elapsed
                             self.status_label.setText(f"Гучність + через {rem:.1f} сек...")
-
                     elif prediction == g2_name:
                         self.gesture1_start_time = None
                         self.gesture3_start_time = None
                         self.gesture4_start_time = None
-
                         if self.gesture2_start_time is None:
                             self.gesture2_start_time = time.time()
-
                         elapsed = time.time() - self.gesture2_start_time
                         if elapsed >= self.required_hold_duration:
                             os.system("start tg://")
@@ -806,15 +1760,12 @@ class GestureApp(QMainWindow):
                         else:
                             rem = self.required_hold_duration - elapsed
                             self.status_label.setText(f"Відкриття Телеграм через {rem:.1f} сек...")
-
                     elif prediction == g3_name:
                         self.gesture1_start_time = None
                         self.gesture2_start_time = None
                         self.gesture4_start_time = None
-
                         if self.gesture3_start_time is None:
                             self.gesture3_start_time = time.time()
-
                         elapsed = time.time() - self.gesture3_start_time
                         if elapsed >= self.required_hold_duration:
                             pyautogui.press("space")
@@ -823,15 +1774,12 @@ class GestureApp(QMainWindow):
                         else:
                             rem = self.required_hold_duration - elapsed
                             self.status_label.setText(f"Пауза через {rem:.1f} сек...")
-
                     elif prediction == g4_name:
                         self.gesture1_start_time = None
                         self.gesture2_start_time = None
                         self.gesture3_start_time = None
-
                         if self.gesture4_start_time is None:
                             self.gesture4_start_time = time.time()
-
                         elapsed = time.time() - self.gesture4_start_time
                         if elapsed >= self.required_hold_duration:
                             h, w, _ = frame.shape
@@ -841,7 +1789,6 @@ class GestureApp(QMainWindow):
                         else:
                             rem = self.required_hold_duration - elapsed
                             self.status_label.setText(f"Серце через {rem:.1f} сек...")
-
                     else:
                         self.gesture1_start_time = None
                         self.gesture2_start_time = None
@@ -852,27 +1799,21 @@ class GestureApp(QMainWindow):
             else:
                 self.right_palm_start_time = None
                 self.status_label.setText("Режим навчання: гарячі дії вимкнено")
-
         elif self.current_features is None:
             self.result_label.setText("Розпізнаний жест: руку не знайдено")
             self.right_palm_start_time = None
 
         if self.mouse_control_active:
             current_landmarks = self._select_hand_landmarks(result, "Right")
-
             if current_landmarks:
                 index_tip = current_landmarks[8]
                 screen_w, screen_h = pyautogui.size()
-
                 mapped_x = self._map_with_margin(index_tip.x)
                 mapped_y = self._map_with_margin(index_tip.y)
-
                 raw_target_x = (1 - mapped_x) * (screen_w - 1)
                 raw_target_y = mapped_y * (screen_h - 1)
-
                 target_x = int(self.cursor_filter_x.filter(raw_target_x))
                 target_y = int(self.cursor_filter_y.filter(raw_target_y))
-
                 pyautogui.moveTo(target_x, target_y, _pause=False)
                 self.status_label.setText(
                     "🖱️ Керування мишкою активне (права рука) — "
@@ -1217,29 +2158,49 @@ class ClusteringWindow(QDialog):
 class StartWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lab 4 | Data Mining & Fuzzy Logic")
-        self.resize(520, 320)
+        self.setWindowTitle("Lab 8 | Data Mining & Text Recognition (CNN)")
+        self.resize(540, 500)
         self.classification_window = None
         self.fuzzy_window = None
+        self.genetic_window = None
+        self.func_window = None
+        self.tree_window = None
+        self.text_cnn_window = None
 
         layout = QVBoxLayout()
-        title = QLabel("Інформаційна система Data Mining\nз модулями Нечіткого Аналізу")
+        title = QLabel("Інформаційна система Data Mining\nз модулями CNN та розпізнаванням тексту")
         title.setStyleSheet("font-size:20px; font-weight:bold; color:#1a365d;")
         layout.addWidget(title)
 
-        classification_button = QPushButton("📷 Вікно розпізнавання жестів & мишки")
+        classification_button = QPushButton("📷 Вікно розпізнавання жестів & мишки (Лаб 1-3)")
         classification_button.clicked.connect(self.open_classification)
 
-        clustering_button = QPushButton("📊 Вікно кластеризації поз (KMeans)")
+        clustering_button = QPushButton("📊 Вікно кластеризації поз KMeans (Лаб 3)")
         clustering_button.clicked.connect(self.open_clustering)
 
-        fuzzy_button = QPushButton("🌀 Вікно нечіткого аналізу (Fuzzy Logic)")
-        fuzzy_button.setStyleSheet("font-weight:bold; background-color:#e2e8f0; padding:8px;")
+        fuzzy_button = QPushButton("🌀 Вікно нечіткого аналізу Fuzzy Logic (Лаб 4)")
         fuzzy_button.clicked.connect(self.open_fuzzy)
+
+        genetic_button = QPushButton("🧬 Вікно Генетичних Алгоритмів (Лаб 5)")
+        genetic_button.clicked.connect(self.open_genetic)
+
+        func_button = QPushButton("📈 Вікно Функціональних Залежностей / Регресії (Лаб 6)")
+        func_button.clicked.connect(self.open_func)
+
+        tree_button = QPushButton("🌳 Вікно Дерев Рішень / Decision Forests (Лаб 7)")
+        tree_button.clicked.connect(self.open_tree)
+
+        text_cnn_button = QPushButton("📝 Вікно розпізнавання тексту та згорткових мереж / CNN (Лаб 8)")
+        text_cnn_button.setStyleSheet("font-weight:bold; background-color:#e2e8f0; padding:8px;")
+        text_cnn_button.clicked.connect(self.open_text_cnn)
 
         layout.addWidget(classification_button)
         layout.addWidget(clustering_button)
         layout.addWidget(fuzzy_button)
+        layout.addWidget(genetic_button)
+        layout.addWidget(func_button)
+        layout.addWidget(tree_button)
+        layout.addWidget(text_cnn_button)
 
         container = QWidget()
         container.setLayout(layout)
@@ -1262,6 +2223,34 @@ class StartWindow(QMainWindow):
         self.fuzzy_window.show()
         self.fuzzy_window.raise_()
         self.fuzzy_window.activateWindow()
+
+    def open_genetic(self):
+        if self.genetic_window is None:
+            self.genetic_window = GeneticAnalysisWindow(self)
+        self.genetic_window.show()
+        self.genetic_window.raise_()
+        self.genetic_window.activateWindow()
+
+    def open_func(self):
+        if self.func_window is None:
+            self.func_window = FunctionalDependencyWindow(self)
+        self.func_window.show()
+        self.func_window.raise_()
+        self.func_window.activateWindow()
+
+    def open_tree(self):
+        if self.tree_window is None:
+            self.tree_window = DecisionTreeWindow(self)
+        self.tree_window.show()
+        self.tree_window.raise_()
+        self.tree_window.activateWindow()
+
+    def open_text_cnn(self):
+        if self.text_cnn_window is None:
+            self.text_cnn_window = TextCnnWindow(self)
+        self.text_cnn_window.show()
+        self.text_cnn_window.raise_()
+        self.text_cnn_window.activateWindow()
 
 
 if __name__ == "__main__":

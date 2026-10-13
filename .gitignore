@@ -9,3 +9,7 @@ results/
 face_landmarker.task
 gaze_calibration.json
 testcode.py
+.kilo/
+!requirements.txt
+!README.md
+run_lab3.bat
